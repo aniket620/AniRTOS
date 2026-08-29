@@ -1,14 +1,9 @@
 # AniRTOS
 
-A real-time operating system for ARM Cortex-M4F, built from scratch —
+A real-time operating system for ARM Cortex-M4F, built from scratch 
 no CMSIS device headers, no HAL, no third-party kernel. Target hardware:
 **NUCLEO-F446RE** (STM32F446RET6). This is a learning project: every
 stage is meant to be read and understood, not just compiled.
-
-> Note: this project originally targeted an STM32F103 ("Blue Pill",
-> Cortex-M3) before the actual hardware turned out to be an
-> STM32F446RE Nucleo (Cortex-M4F) — Stage 1 was rewritten accordingly.
-> If you see "M3" anywhere in older notes, that's why.
 
 ## Status: Stage 5a complete — blocking, waking, and the first semaphore
 
