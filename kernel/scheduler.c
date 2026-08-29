@@ -94,7 +94,13 @@
  * demo only ever adds 2. */
 #define MAX_TASKS 8
 
-static TCB_t *ready_list[MAX_TASKS];
+/* Renamed from Stage 4's `ready_list`: this array now holds EVERY task
+ * that's ever been registered, whether it's currently eligible to run or
+ * not - "ready" stopped being an accurate name for it the moment
+ * TASK_BLOCKED became possible. Each entry's own `state` field is what
+ * actually says whether it's a candidate right now; see
+ * pick_next_ready(). */
+static TCB_t *task_list[MAX_TASKS];
 static uint32_t num_tasks = 0;
 static uint32_t current_index = 0;
 static volatile uint32_t slice_remaining = TIME_SLICE_TICKS;
@@ -108,8 +114,77 @@ void scheduler_add_task(TCB_t *tcb)
         for (;;) {
         }
     }
-    ready_list[num_tasks] = tcb;
+    task_list[num_tasks] = tcb;
     num_tasks++;
+}
+
+/*
+ * The one place "who runs next" is actually decided. Walks task_list in
+ * round-robin order STARTING RIGHT AFTER the current task, looking for
+ * the first one that's TASK_READY - skipping any TASK_BLOCKED task
+ * entirely, which is the entire mechanism by which blocking removes a
+ * task from the rotation without needing a second data structure to
+ * track "who's still eligible".
+ *
+ * The search deliberately walks all the way around, including back to
+ * the CURRENT task's own slot (i == num_tasks checks index
+ * current_index itself). Two outcomes fall out of that for free, with no
+ * special-casing needed:
+ *
+ *   - If some OTHER task is READY, it's found first (it's earlier in the
+ *     search order) and returned - normal round-robin.
+ *   - If NO other task is READY: if the current task is itself still
+ *     READY (the ordinary Stage-4-style case - nothing blocked, just a
+ *     single-task or fully-busy system), the search eventually comes
+ *     back around to it and returns ITS OWN index - correctly signaling
+ *     "nobody else to switch to". If the current task is BLOCKED too
+ *     (it just called sem_wait() and lost on the fast path), that same
+ *     final check fails as well, and -1 comes back: genuinely nothing in
+ *     the whole system is runnable.
+ *
+ * That last case is a real, currently-unhandled limitation, not a
+ * far-fetched edge case: this project has no idle task yet (that's
+ * Stage 10's job - see the roadmap). Until then, whatever's built on top
+ * of this scheduler has to guarantee at least one task is always
+ * TASK_READY. Stage 5's demo (app/main.c) is deliberately designed
+ * around that constraint - see docs/blocking_and_semaphores.md.
+ */
+static int32_t pick_next_ready(void)
+{
+    for (uint32_t i = 1; i <= num_tasks; i++) {
+        uint32_t idx = (current_index + i) % num_tasks;
+        if (task_list[idx]->state == TASK_READY) {
+            return (int32_t)idx;
+        }
+    }
+    return -1;   /* nothing runnable anywhere - see the comment above */
+}
+
+void scheduler_yield(void)
+{
+    int32_t next = pick_next_ready();
+
+    if (next < 0) {
+        /* Nothing READY anywhere, including whoever called this. No
+         * idle task exists to fall back to yet (Stage 10). Trap loudly
+         * rather than silently returning into a task that has no
+         * business running - see docs/blocking_and_semaphores.md. */
+        for (;;) {
+        }
+    }
+
+    if ((uint32_t)next == current_index) {
+        /* pick_next_ready() only returns the current task's own index
+         * when nothing ELSE is READY - meaning the caller is still
+         * READY itself (a blocked caller can never match its own index;
+         * its own state check fails). There's genuinely nothing to
+         * switch to, so don't pay for a pointless save/restore through
+         * PendSV just to land back in the exact same place. */
+        return;
+    }
+
+    current_index = (uint32_t)next;
+    kernel_switch_to(task_list[current_index]);
 }
 
 void kernel_start(void)
@@ -139,7 +214,7 @@ void kernel_start(void)
     current_task = 0;
     current_index = 0;
     slice_remaining = TIME_SLICE_TICKS;
-    kernel_switch_to(ready_list[0]);
+    kernel_switch_to(task_list[0]);
 
     for (;;) {
         /* Safety net only - see kernel/task.c's kernel_start_first_task()
@@ -161,21 +236,14 @@ void SysTick_Handler(void)
     if (slice_remaining == 0) {
         slice_remaining = TIME_SLICE_TICKS;
 
-        if (num_tasks > 1) {
-            current_index = (current_index + 1) % num_tasks;
-
-            /* This is the ENTIRE "switch": decide who's next, hand that
-             * decision to the mechanism layer via the exact same
-             * function a task used to call on itself in Stage 3.
-             * kernel_switch_to() just sets next_task and pends PendSV -
-             * it does not touch PSP, R4-R11, or anything else that would
-             * only be safe to touch once nothing else is mid-flight. The
-             * actual switch happens later, in PendSV_Handler, once this
-             * handler (and anything it might itself be nested inside of)
-             * has fully returned. See this file's header comment. */
-            kernel_switch_to(ready_list[current_index]);
-        }
-        /* num_tasks == 1: nothing to switch TO - let the one task keep
-         * running. Round-robin among one task is a no-op by definition. */
+        /* This is the ENTIRE forced-preemption "switch": decide who's
+         * next (skipping anyone TASK_BLOCKED) and hand that decision to
+         * the mechanism layer. scheduler_yield() is the exact same
+         * function kernel/sem.c's sem_wait() calls when a task
+         * voluntarily blocks - the timer-driven and the sync-primitive-
+         * driven paths both funnel through one place that decides "who's
+         * next", which is what keeps this file's mechanism/policy split
+         * intact even with two different reasons to reschedule now. */
+        scheduler_yield();
     }
 }

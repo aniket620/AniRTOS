@@ -12,20 +12,46 @@
 #include <stdint.h>
 
 /*
- * Task Control Block - Stage 3's minimal version. Just enough to context-
- * switch: a saved stack pointer, and nothing else yet (no priority, no
- * ready/blocked state, no ready list - that's Stage 4's scheduler).
+ * Task Control Block. `sp` MUST be the first member. kernel/pendsv.S
+ * dereferences a TCB_t* directly as a plain address holding a uint32_t*
+ * at offset 0 - it has no idea this struct exists, or what else might be
+ * in it. Add a field before `sp` and PendSV_Handler silently reads/writes
+ * the wrong memory, with no compiler warning anywhere. This is not a
+ * hypothetical concern - FreeRTOS's own TCB has this exact same
+ * constraint on its first member (`pxTopOfStack`), for the exact same
+ * reason. Everything AFTER `sp`, by contrast, is free real estate -
+ * nothing in the assembly ever looks at it.
  *
- * `sp` MUST be the first member. kernel/pendsv.S dereferences a TCB_t*
- * directly as a plain address holding a uint32_t* at offset 0 - it has
- * no idea this struct exists, or what else might be in it. Add a field
- * before `sp` and PendSV_Handler silently reads/writes the wrong memory,
- * with no compiler warning anywhere. This is not a hypothetical
- * concern - FreeRTOS's own TCB has this exact same constraint on its
- * first member (`pxTopOfStack`), for the exact same reason.
+ * Stage 5 adds two fields, both needed the moment a task can BLOCK
+ * (wait on something not yet available) instead of always being
+ * immediately runnable:
+ *
+ *   - `state`: is this task actually eligible to run right now? Through
+ *     Stage 4, every created task was always eligible - the scheduler's
+ *     round-robin simply cycled through all of them. That stops being
+ *     true the moment a task can call sem_wait() on an empty semaphore -
+ *     it has to leave the rotation until something wakes it back up.
+ *   - `next_waiter`: when a task IS blocked, something needs to remember
+ *     it, so whoever eventually satisfies the wait (sem_post(), etc.)
+ *     knows who to wake. Rather than a separate array-based "waiting
+ *     list" data structure, this is an INTRUSIVE linked list: the "next"
+ *     pointer for the list lives directly inside the TCB being linked,
+ *     the same way many real kernels (including FreeRTOS) do it. A
+ *     semaphore, in turn, only needs to store one thing - a pointer to
+ *     the head of whichever chain of waiting TCBs is currently queued on
+ *     it (see kernel/sem.h). No fixed-size array, no separate allocator -
+ *     just pointers threaded through TCBs that already exist.
  */
+typedef enum {
+    TASK_READY   = 0,   /* eligible to be picked by the scheduler */
+    TASK_BLOCKED = 1,   /* waiting on something (a semaphore, for now) - skipped by the scheduler until woken */
+} task_state_t;
+
 typedef struct TCB {
-    uint32_t *sp;
+    uint32_t *sp;              /* MUST stay first - see above */
+    task_state_t state;
+    struct TCB *next_waiter;   /* NULL when not on any wait list; otherwise the next TCB in whichever
+                                 * intrusive chain this task is currently queued on */
 } TCB_t;
 
 /* current_task: whichever task PendSV_Handler is currently running "as".
@@ -76,6 +102,16 @@ void scheduler_add_task(TCB_t *tcb);
  * to. Never returns. Call once, after every task has been created with
  * task_init() and registered with scheduler_add_task(). */
 void kernel_start(void);
+
+/* Stage 5: give up the CPU RIGHT NOW and let the scheduler pick whoever
+ * should run next, skipping any TASK_BLOCKED task. This is the one place
+ * "who runs next" is actually decided (see kernel/scheduler.c) - both
+ * SysTick_Handler (forced, periodic: your time slice ran out) and
+ * kernel/sem.c's sem_wait() (voluntary, immediate: you have nothing to
+ * do until something wakes you) call this same function. If the caller
+ * is itself still the only READY task, this is a safe no-op - see
+ * kernel/scheduler.c. */
+void scheduler_yield(void);
 
 /* Defined in kernel/pendsv.S. Never called directly from C - installed
  * into the vector table by name; its strong definition here overrides

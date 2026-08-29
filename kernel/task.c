@@ -90,6 +90,11 @@ void task_init(TCB_t *tcb, uint32_t *stack, uint32_t stack_words,
     }
 
     tcb->sp = sp;   /* PendSV_Handler's restore path expects this to point at the R4 slot */
+
+    /* Stage 5: every freshly-created task starts out eligible to run, and
+     * isn't queued on anything's wait list yet. */
+    tcb->state = TASK_READY;
+    tcb->next_waiter = 0;
 }
 
 void kernel_switch_to(TCB_t *next)

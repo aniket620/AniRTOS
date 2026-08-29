@@ -10,15 +10,19 @@ stage is meant to be read and understood, not just compiled.
 > STM32F446RE Nucleo (Cortex-M4F) — Stage 1 was rewritten accordingly.
 > If you see "M3" anywhere in older notes, that's why.
 
-## Status: Stage 4 complete — real preemptive scheduling
+## Status: Stage 5a complete — blocking, waking, and the first semaphore
 
-Still missing synchronization primitives, syscalls, and memory
-protection, but the core loop of a real RTOS is now in place: a hardware
-timer (`SysTick`) interrupts on a fixed schedule, a round-robin scheduler
-decides who runs next, and `PendSV` performs the actual switch — tasks no
-longer choose when they give up the CPU, the way they still did in Stage
-3. That's the last conceptual piece separating "two tasks that can switch
-when asked" from "a scheduler."
+Stage 5 (synchronization primitives) is big enough to be built in
+sub-stages: 5a lands blocking/waking + a counting semaphore; 5b will add
+task priorities; 5c priority-inheriting mutexes (and the priority-
+inversion problem they solve); 5d message queues. This is 5a.
+
+Through Stage 4, every task was always runnable — the scheduler only had
+to decide *whose turn* it was. Stage 5a adds the other half: a task that
+genuinely has nothing to do right now, marked `TASK_BLOCKED` and skipped
+by the scheduler entirely, until something wakes it back up. That's the
+mechanism every higher-level synchronization primitive (mutexes, queues,
+anything that blocks) ends up built on.
 
 **Stage 1 (bare-metal bring-up)** — proof the chip boots, runs your code,
 and can toggle a pin:
@@ -111,6 +115,38 @@ via gdb (using Ctrl-C to interrupt the free-running target, since this
 stage has no single deterministic breakpoint the way Stages 2-3 did) —
 see `docs/tick_scheduler.md` for the full recipe.
 
+**Stage 5a (blocking, waking, and the first semaphore)** — a task can now
+genuinely have nothing to do:
+
+- `kernel/kernel.h` — `TCB_t` gains `state` (`TASK_READY`/`TASK_BLOCKED`)
+  and `next_waiter` (an intrusive linked-list pointer, threaded directly
+  through TCBs — no separate waiter data structure needed)
+- `kernel/scheduler.c` — `pick_next_ready()` walks the task list skipping
+  anyone `TASK_BLOCKED`; `scheduler_yield()` is the one place "who runs
+  next" is decided, called both by `SysTick_Handler` (forced, periodic)
+  and by a task blocking on a semaphore (voluntary, immediate) — same
+  mechanism/policy split as Stage 4, one layer up
+- `kernel/sem.h` / `kernel/sem.c` — a counting semaphore: `sem_wait()`
+  (fast path if a unit's available; otherwise blocks and yields),
+  `sem_post()` (direct hand-off to a waiting task, or banks a unit if
+  nobody's waiting) — both protected by `cpsid i`/`cpsie i` critical
+  sections (a blunt stopgap; Stage 7 refines this)
+- `app/main.c` — `task_producer` (never blocks) periodically
+  `sem_post()`s; `task_consumer` spends nearly all its life blocked in
+  `sem_wait()`, toggling the LED only when woken. `producer_posts` and
+  `consumer_wakes` are the verification signal — they should track each
+  other closely no matter how differently timed the two tasks are
+
+Verified statically (disassembly confirms `cpsid`/`cpsie i` genuinely
+bracket both semaphore functions, and `task_init()` correctly initializes
+the new TCB fields at their expected offsets). Functional verification on
+real hardware: `producer_posts`/`consumer_wakes` climbing together live
+via gdb, and `current_task`/`tasks[1].state` confirming the consumer is
+really `TASK_BLOCKED` between wakeups, not busy-waiting — see
+`docs/blocking_and_semaphores.md` for the full recipe. Note: this project
+has no idle task yet (Stage 10), so the demo deliberately keeps
+`task_producer` always runnable — see the same doc for why.
+
 ## Building
 
 ```
@@ -159,10 +195,13 @@ every mechanism it depends on.
    (and why the switch happens in `PendSV`, at the lowest exception
    priority, and not directly in `SysTick_Handler`). See
    `kernel/scheduler.c`, `docs/tick_scheduler.md`.
-5. **Synchronization primitives** — semaphores, mutexes (with priority
-   inheritance, and *why* naive mutexes cause priority inversion),
-   message queues; blocking/waking tasks and how that interacts with the
-   scheduler's ready list.
+5. **Synchronization primitives** — in progress, built as sub-stages:
+   - 5a ✅ blocking/waking + a counting semaphore (this stage — see
+     `kernel/sem.c`, `docs/blocking_and_semaphores.md`)
+   - 5b task priorities + priority-based scheduling
+   - 5c mutexes with priority inheritance (and *why* naive mutexes cause
+     priority inversion)
+   - 5d message queues
 6. **SVC-based syscalls** — move kernel entry points behind `SVC`
    instructions instead of calling kernel functions directly from task
    code, so user tasks and kernel code have a real privilege boundary
@@ -209,7 +248,7 @@ doing" — everything after that is refinement and features.
 ```
 boot/     startup code, linker script, clock init, register definitions
 drivers/  peripheral drivers (GPIO now; UART etc. later)
-kernel/   MSP/PSP switch, TCB, PendSV context switch, SysTick + round-robin scheduler; Stage 5+ adds sync prims
+kernel/   MSP/PSP switch, TCB, PendSV context switch, SysTick + round-robin scheduler, sync primitives (sem.c, more to come in 5b-5d)
 app/      the application/demo task(s)
 cmake/    toolchain file
 docs/     deep-dive explanations per stage

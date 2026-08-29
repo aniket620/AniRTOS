@@ -17,6 +17,7 @@ add_executable(anirtos
     kernel/pendsv.S
     kernel/task.c
     kernel/scheduler.c
+    kernel/sem.c
     drivers/gpio.c
     app/main.c
 )
