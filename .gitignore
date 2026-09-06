@@ -6,3 +6,4 @@ build/
 *.hex
 *.map
 .DS_Store
+.Rhistory
