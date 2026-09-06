@@ -47,9 +47,32 @@ typedef enum {
     TASK_BLOCKED = 1,   /* waiting on something (a semaphore, for now) - skipped by the scheduler until woken */
 } task_state_t;
 
+/*
+ * Stage 5b: not every task is equally important. `priority` says how
+ * much: HIGHER NUMBER = HIGHER PRIORITY (a priority-2 task always beats
+ * a priority-0 task for the CPU whenever both are READY).
+ *
+ * Deliberately flagging this because it's the OPPOSITE convention from
+ * the ARM exception priorities this project already uses everywhere
+ * else (SCB_SHPR3, kernel_init() - where 0 is the HIGHEST hardware
+ * priority and 0xFF is the lowest). Two genuinely different concepts
+ * share the word "priority" in this codebase: hardware exception
+ * priority (lower number wins - an ARM architecture convention this
+ * project didn't choose) and task scheduling priority (higher number
+ * wins - a convention THIS project chose, matching the more common
+ * RTOS-textbook/FreeRTOS style, because "bigger number, bigger deal" is
+ * the more intuitive default for application code). They never mix in
+ * the same comparison, but keep the direction straight when reading
+ * task.c/scheduler.c versus sem.c's critical sections.
+ */
+#define TASK_PRIORITY_LOW    0
+#define TASK_PRIORITY_NORMAL 1
+#define TASK_PRIORITY_HIGH   2
+
 typedef struct TCB {
     uint32_t *sp;              /* MUST stay first - see above */
     task_state_t state;
+    uint8_t priority;          /* higher = more important - see above */
     struct TCB *next_waiter;   /* NULL when not on any wait list; otherwise the next TCB in whichever
                                  * intrusive chain this task is currently queued on */
 } TCB_t;
@@ -73,9 +96,12 @@ void kernel_init(void);
 /* Hand-craft an initial stack frame for `tcb`, inside `stack` (an array
  * of `stack_words` uint32_t's), so the first time PendSV "restores" this
  * task, execution starts at `entry(arg)` as if it had been interrupted
- * mid-flight - even though it never actually ran before. */
+ * mid-flight - even though it never actually ran before. `priority` is
+ * one of TASK_PRIORITY_LOW/NORMAL/HIGH (or any uint8_t - those are just
+ * convenient names, not a hard limit) - see the note above TCB_t for the
+ * higher-number-wins convention. */
 void task_init(TCB_t *tcb, uint32_t *stack, uint32_t stack_words,
-               task_entry_t entry, void *arg);
+               task_entry_t entry, void *arg, uint8_t priority);
 
 /* Request an immediate switch to `next`. Pends PendSV and returns
  * normally to the caller - but "normally" here can mean "a long time

@@ -1,23 +1,24 @@
 # AniRTOS
 
-A real-time operating system for ARM Cortex-M4F, built from scratch 
+A real-time operating system for ARM Cortex-M4F, built from scratch —
 no CMSIS device headers, no HAL, no third-party kernel. Target hardware:
 **NUCLEO-F446RE** (STM32F446RET6). This is a learning project: every
 stage is meant to be read and understood, not just compiled.
 
-## Status: Stage 5a complete — blocking, waking, and the first semaphore
+## Status: Stage 5b complete — task priorities and immediate preemption
 
 Stage 5 (synchronization primitives) is big enough to be built in
-sub-stages: 5a lands blocking/waking + a counting semaphore; 5b will add
-task priorities; 5c priority-inheriting mutexes (and the priority-
-inversion problem they solve); 5d message queues. This is 5a.
+sub-stages: 5a landed blocking/waking + a counting semaphore; 5b (this
+one) adds task priorities and preemption that happens the instant it's
+warranted, not at the next tick; 5c will add priority-inheriting mutexes
+(and the priority-inversion problem they solve); 5d message queues.
 
-Through Stage 4, every task was always runnable — the scheduler only had
-to decide *whose turn* it was. Stage 5a adds the other half: a task that
-genuinely has nothing to do right now, marked `TASK_BLOCKED` and skipped
-by the scheduler entirely, until something wakes it back up. That's the
-mechanism every higher-level synchronization primitive (mutexes, queues,
-anything that blocks) ends up built on.
+Stage 5a added the ability for a task to genuinely have nothing to
+do — marked `TASK_BLOCKED` and skipped by the scheduler entirely until
+something wakes it back up. Stage 5b builds on that: not every task is
+equally important, and a high-priority task waking up now takes the CPU
+immediately, rather than waiting its turn behind whoever's currently
+running.
 
 **Stage 1 (bare-metal bring-up)** — proof the chip boots, runs your code,
 and can toggle a pin:
@@ -142,6 +143,37 @@ really `TASK_BLOCKED` between wakeups, not busy-waiting — see
 has no idle task yet (Stage 10), so the demo deliberately keeps
 `task_producer` always runnable — see the same doc for why.
 
+**Stage 5b (task priorities and immediate preemption)** — not every task
+is equally important, and now the scheduler knows it:
+
+- `kernel/kernel.h` — `TCB_t` gains `priority` (`TASK_PRIORITY_LOW` /
+  `NORMAL` / `HIGH` — higher number wins, the OPPOSITE convention from
+  ARM's own hardware exception priorities used elsewhere in this project,
+  documented explicitly to avoid mixing them up); `task_init()` takes a
+  priority argument
+- `kernel/scheduler.c` — `pick_next_ready()` becomes a two-pass search:
+  find the highest priority among `TASK_READY` tasks, then round-robin
+  only among tasks at that tier — priority breaks ties across tiers,
+  round-robin still breaks ties within one
+- `kernel/sem.c` — `sem_post()` now calls `scheduler_yield()` immediately
+  after waking a task (only on that path, never on the "just bank a
+  unit" path) — this is what makes priority-based preemption real: a
+  high-priority task that was just woken runs *right now*, not whenever
+  the next `SysTick` tick happens to land
+- `app/main.c` — `task_low` (never blocks, doubles as the "someone must
+  always be ready" task) periodically posts to a semaphore; `task_high`
+  blocks almost all the time and should take over the instant
+  `task_low` posts
+
+Verified statically (disassembly confirms the two-pass priority search
+in `pick_next_ready()`, and that `sem_post()` only calls
+`scheduler_yield()` on the wake path). Functional verification on real
+hardware used a targeted breakpoint at the exact `scheduler_yield()` call
+inside `sem_post()` to prove the switch to the high-priority task happens
+synchronously, inside `sem_post()` itself — not "eventually" — see
+`docs/priority_scheduling.md` for the full recipe and the reasoning
+behind the higher-number-wins convention.
+
 ## Building
 
 ```
@@ -191,9 +223,10 @@ every mechanism it depends on.
    priority, and not directly in `SysTick_Handler`). See
    `kernel/scheduler.c`, `docs/tick_scheduler.md`.
 5. **Synchronization primitives** — in progress, built as sub-stages:
-   - 5a ✅ blocking/waking + a counting semaphore (this stage — see
-     `kernel/sem.c`, `docs/blocking_and_semaphores.md`)
-   - 5b task priorities + priority-based scheduling
+   - 5a ✅ blocking/waking + a counting semaphore — see `kernel/sem.c`,
+     `docs/blocking_and_semaphores.md`
+   - 5b ✅ task priorities + immediate priority-based preemption (this
+     stage — see `kernel/scheduler.c`, `docs/priority_scheduling.md`)
    - 5c mutexes with priority inheritance (and *why* naive mutexes cause
      priority inversion)
    - 5d message queues

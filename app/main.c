@@ -1,29 +1,32 @@
 /*
- * Stage 5a: blocking and waking, via a counting semaphore.
+ * Stage 5b: task priorities, and preemption that happens IMMEDIATELY,
+ * not just at the next tick.
  *
- * Stage 4's two tasks were both ALWAYS runnable - the scheduler's only
- * job was deciding whose turn it was among tasks that all had something
- * to do. This stage adds a task that, most of the time, genuinely has
- * NOTHING to do: task_consumer spends nearly all of its life BLOCKED,
- * and only actually runs for a handful of instructions each time
- * task_producer wakes it up.
+ * Two tasks, deliberately unequal:
  *
- * task_producer never blocks - it just loops on a delay and posts to a
- * semaphore periodically. That's not an arbitrary choice: this project
- * has no idle task yet (that's Stage 10), so the scheduler has nothing
- * to fall back to if EVERY task is blocked at once (see
- * kernel/scheduler.c's pick_next_ready()). Keeping task_producer always
- * TASK_READY is what this demo relies on to avoid that situation - a
- * real constraint worth being honest about, not hidden.
+ *   task_low  (TASK_PRIORITY_LOW)  - the "background work" task. Never
+ *     blocks - always has something to do, so it's also what keeps this
+ *     project's no-idle-task constraint satisfied (see
+ *     kernel/scheduler.c's pick_next_ready() comment). Periodically
+ *     posts to event_sem, the way a background loop might notice
+ *     something worth escalating.
  *
- * task_consumer calls sem_wait() in a loop. Every time task_producer
- * posts, task_consumer wakes up, toggles the LED once, and goes right
- * back to waiting. So the LED's blink rate is now controlled entirely by
- * the PRODUCER's timing, even though it's the CONSUMER's code that
- * touches the GPIO - a real, visible demonstration that blocking/waking
- * is doing its job: task_consumer is provably not running (not spinning,
- * not polling, not burning CPU checking "is it my turn yet") for the
- * entire stretch between blinks.
+ *   task_high (TASK_PRIORITY_HIGH) - the "must respond right away" task.
+ *     Spends nearly all its life blocked in sem_wait(), and the instant
+ *     task_low posts, task_high should take the CPU IMMEDIATELY - not
+ *     whenever task_low's current time slice happens to run out. That
+ *     immediacy is the entire point of Stage 5b: kernel/sem.c's
+ *     sem_post() now calls scheduler_yield() right after waking a task,
+ *     specifically so a higher-priority task doesn't have to wait its
+ *     turn the way Stage 5a's tasks did.
+ *
+ * Contrast with Stage 5a: there, producer and consumer had no priority
+ * distinction (both defaulted to whatever "equal footing" meant before
+ * priorities existed), and a wake only changed eligibility - the
+ * scheduler decided when to actually act on it, sometimes tens of
+ * milliseconds later. Here, task_high's priority means it's not merely
+ * "eventually going to run" once woken - it wins immediately, every
+ * time, over task_low.
  */
 #include <stdint.h>
 #include "gpio.h"
@@ -34,21 +37,20 @@ extern void SwitchToPSP(void);
 
 #define TASK_STACK_WORDS 64   /* 256 bytes - plenty for these tiny tasks */
 
-static uint32_t producer_stack[TASK_STACK_WORDS];
-static uint32_t consumer_stack[TASK_STACK_WORDS];
+static uint32_t low_stack[TASK_STACK_WORDS];
+static uint32_t high_stack[TASK_STACK_WORDS];
 static TCB_t tasks[2];
 
-static sem_t blink_sem;
+static sem_t event_sem;
 
-/* The verification signal for this stage - see docs/blocking_and_semaphores.md.
- * producer_posts counts how many times task_producer called sem_post();
- * consumer_wakes counts how many times task_consumer's sem_wait() actually
- * returned. If blocking/waking is working, these two track each other
- * closely no matter how differently timed the two tasks are - that's the
- * whole point of a semaphore: it makes "signal" and "response" match up
- * exactly, without either task polling the other. */
-static volatile uint32_t producer_posts = 0;
-static volatile uint32_t consumer_wakes = 0;
+/* Verification signal - see docs/priority_scheduling.md. low_runs counts
+ * task_low's loop iterations (and therefore how many times it posted);
+ * high_runs counts how many times task_high was actually woken and ran.
+ * As in Stage 5a, these should track closely - but this stage's REAL
+ * point isn't the counters, it's WHEN the switch happens (immediately,
+ * provable with a targeted breakpoint - see the docs). */
+static volatile uint32_t low_runs = 0;
+static volatile uint32_t high_runs = 0;
 
 static void delay(volatile uint32_t count)
 {
@@ -57,27 +59,27 @@ static void delay(volatile uint32_t count)
     }
 }
 
-static void task_producer(void *arg)
+static void task_low(void *arg)
 {
     (void)arg;
     for (;;) {
-        delay(800000);          /* stands in for "some real event happened" - a sensor
-                                  * reading, a button press, a byte arriving on a UART -
-                                  * anything a later stage might trigger this from */
-        producer_posts++;
-        sem_post(&blink_sem);   /* never blocks; just updates count/waiters and returns */
+        delay(800000);         /* stands in for "doing some background work" */
+        sem_post(&event_sem);  /* "...and noticed something worth escalating" -
+                                 * this call itself is where task_high, being
+                                 * higher priority, immediately takes over */
+        low_runs++;
     }
 }
 
-static void task_consumer(void *arg)
+static void task_high(void *arg)
 {
     (void)arg;
     for (;;) {
-        sem_wait(&blink_sem);   /* returns immediately if a post is already banked in
-                                  * count; otherwise this task is TASK_BLOCKED and off
-                                  * the scheduler's rotation until task_producer posts */
+        sem_wait(&event_sem);   /* blocked almost all the time; the moment this
+                                  * returns, it's because task_low just posted
+                                  * and handed the CPU here right away */
         gpio_led_toggle();
-        consumer_wakes++;
+        high_runs++;
     }
 }
 
@@ -86,11 +88,11 @@ int main(void)
     SwitchToPSP();  /* Stage 2's switch - still the required first step. See docs/context_switch.md. */
     gpio_led_init();
 
-    sem_init(&blink_sem, 0);   /* starts at 0 - the very first sem_wait() should genuinely
-                                 * block until the first sem_post(), not fall through */
+    sem_init(&event_sem, 0);   /* starts empty - task_high should genuinely block
+                                 * until the first post */
 
-    task_init(&tasks[0], producer_stack, TASK_STACK_WORDS, task_producer, 0);
-    task_init(&tasks[1], consumer_stack, TASK_STACK_WORDS, task_consumer, 0);
+    task_init(&tasks[0], low_stack,  TASK_STACK_WORDS, task_low,  0, TASK_PRIORITY_LOW);
+    task_init(&tasks[1], high_stack, TASK_STACK_WORDS, task_high, 0, TASK_PRIORITY_HIGH);
 
     scheduler_add_task(&tasks[0]);
     scheduler_add_task(&tasks[1]);

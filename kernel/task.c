@@ -55,7 +55,7 @@ void kernel_init(void)
 }
 
 void task_init(TCB_t *tcb, uint32_t *stack, uint32_t stack_words,
-               task_entry_t entry, void *arg)
+               task_entry_t entry, void *arg, uint8_t priority)
 {
     /*
      * Build a 16-word frame at the TOP of `stack` (stacks grow down, so
@@ -91,10 +91,15 @@ void task_init(TCB_t *tcb, uint32_t *stack, uint32_t stack_words,
 
     tcb->sp = sp;   /* PendSV_Handler's restore path expects this to point at the R4 slot */
 
-    /* Stage 5: every freshly-created task starts out eligible to run, and
-     * isn't queued on anything's wait list yet. */
+    /* Stage 5a: every freshly-created task starts out eligible to run,
+     * and isn't queued on anything's wait list yet. Stage 5b: and now
+     * has a priority, set once here and never changed elsewhere in this
+     * project (no priority-change API yet - not needed until something
+     * like priority inheritance, Stage 5c, requires temporarily raising
+     * one). */
     tcb->state = TASK_READY;
     tcb->next_waiter = 0;
+    tcb->priority = priority;
 }
 
 void kernel_switch_to(TCB_t *next)

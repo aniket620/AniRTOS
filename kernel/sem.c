@@ -75,6 +75,8 @@ void sem_wait(sem_t *sem)
 
 void sem_post(sem_t *sem)
 {
+    TCB_t *woken = 0;
+
     __asm__ volatile ("cpsid i");
 
     if (sem->waiters != 0) {
@@ -87,17 +89,10 @@ void sem_post(sem_t *sem)
          * counting-semaphore behavior would be broken. Direct hand-off
          * means the unit is already spoken for the instant sem_post()
          * runs, not merely "available". */
-        TCB_t *woken = sem->waiters;
+        woken = sem->waiters;
         sem->waiters = woken->next_waiter;
         woken->next_waiter = 0;
         woken->state = TASK_READY;
-        /* Note what does NOT happen here: no call to scheduler_yield()
-         * or kernel_switch_to(). Marking a task TASK_READY only changes
-         * its ELIGIBILITY - whether it actually runs next, or waits its
-         * turn behind whoever's currently running, is still entirely
-         * the round-robin scheduler's decision (kernel/scheduler.c). A
-         * sync primitive's job is deciding who's ALLOWED to run; the
-         * scheduler's job is deciding who ACTUALLY does, right now. */
     } else {
         /* Nobody's waiting - bank the unit for whoever calls sem_wait()
          * next, whenever that is. */
@@ -105,4 +100,42 @@ void sem_post(sem_t *sem)
     }
 
     __asm__ volatile ("cpsie i");
+
+    /*
+     * Stage 5a said sem_post() never forces a switch - marking a task
+     * TASK_READY only changed its ELIGIBILITY, and the round-robin
+     * scheduler alone decided who actually ran, whenever it next felt
+     * like deciding. Stage 5b changes this, and deliberately: THIS is
+     * what "priority-based preemption" means in practice. If `woken`
+     * genuinely outranks whoever's running right now, that has to take
+     * effect immediately - not whenever the next SysTick tick happens to
+     * land (up to 20ms later, per TIME_SLICE_TICKS). A task waiting on a
+     * high-priority event and getting to it "eventually, next tick"
+     * defeats the entire point of giving it a high priority.
+     *
+     * Calling scheduler_yield() unconditionally here (only when we
+     * actually woke someone - never on the plain "bank a unit" path,
+     * where nothing's eligibility changed) is still safe and cheap even
+     * when it turns out NOT to be warranted: scheduler_yield() always
+     * re-derives "who's actually highest-priority-ready" via
+     * pick_next_ready() itself, and its self-check already handles "the
+     * current task is still the best choice" as a no-op (see
+     * kernel/scheduler.c). This function doesn't need to compare
+     * priorities itself - it just asks the one place that already knows
+     * how to answer that question, every time something might have
+     * changed.
+     *
+     * One honest side effect worth naming: if `woken` turns out to be
+     * the SAME priority as whoever's running (not higher), this can
+     * still cause an immediate switch to it, if it's next up in the
+     * round-robin order - slightly different from strict textbook/
+     * FreeRTOS-style semantics, where only a STRICTLY higher priority
+     * wake preempts immediately, and an equal-priority wake just joins
+     * the ready line for its normal turn. Harmless here (it's still a
+     * legitimate round-robin turn, just taken a little early), and not
+     * worth the extra bookkeeping to special-case yet.
+     */
+    if (woken != 0) {
+        scheduler_yield();
+    }
 }

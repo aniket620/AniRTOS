@@ -48,10 +48,13 @@ void sem_wait(sem_t *sem);
 
 /* Give back one unit. If a task is already waiting, it's woken directly
  * (handed the unit, without ever touching `count` - see the source for
- * why). Otherwise the unit is banked in `count` for whichever task calls
- * sem_wait() next. Never blocks, and does NOT force an immediate switch
- * to the task it wakes - it only makes that task eligible again; whether
- * it actually runs next is still entirely the scheduler's call. */
+ * why) and, since Stage 5b, control passes to the scheduler right away
+ * so a higher-priority task that was just woken runs IMMEDIATELY rather
+ * than waiting for the next SysTick tick - that immediacy is what
+ * "priority-based preemption" actually means. If nobody's waiting, the
+ * unit is simply banked in `count` for whichever task calls sem_wait()
+ * next, and this never blocks either way. See kernel/sem.c and
+ * docs/priority_scheduling.md for the full reasoning. */
 void sem_post(sem_t *sem);
 
 #endif /* SEM_H */

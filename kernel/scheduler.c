@@ -146,18 +146,51 @@ void scheduler_add_task(TCB_t *tcb)
  * far-fetched edge case: this project has no idle task yet (that's
  * Stage 10's job - see the roadmap). Until then, whatever's built on top
  * of this scheduler has to guarantee at least one task is always
- * TASK_READY. Stage 5's demo (app/main.c) is deliberately designed
- * around that constraint - see docs/blocking_and_semaphores.md.
+ * TASK_READY. Stage 5's demos (app/main.c) are deliberately designed
+ * around that constraint - see docs/blocking_and_semaphores.md and
+ * docs/priority_scheduling.md.
+ *
+ * Stage 5b adds a second dimension on top of the READY/BLOCKED check:
+ * priority. It's not enough to find SOME ready task any more - among
+ * everyone ready, the one with the HIGHEST priority (see kernel.h's
+ * higher-number-wins convention) must win, every time. This is a
+ * two-pass search:
+ *
+ *   1. Scan every task, find the highest `priority` value among those
+ *      that are currently TASK_READY.
+ *   2. Round-robin search (same starting-after-current_index walk as
+ *      Stage 5a) but ONLY among tasks that are both TASK_READY AND at
+ *      that highest priority tier. Equal-priority tasks still get fair
+ *      round-robin treatment among themselves - priority breaks ties
+ *      ACROSS tiers, round-robin breaks ties WITHIN a tier.
+ *
+ * The "come back around to my own slot" fallback still works exactly as
+ * before: if nothing outranks the current task, the highest ready
+ * priority IS the current task's own priority, and it'll be found again
+ * when the search wraps around - scheduler_yield()'s existing self-check
+ * still turns that into a safe no-op.
  */
 static int32_t pick_next_ready(void)
 {
+    /* Pass 1: what's the best priority currently on offer? */
+    int32_t highest = -1;
+    for (uint32_t i = 0; i < num_tasks; i++) {
+        if (task_list[i]->state == TASK_READY && (int32_t)task_list[i]->priority > highest) {
+            highest = (int32_t)task_list[i]->priority;
+        }
+    }
+    if (highest < 0) {
+        return -1;   /* nothing runnable anywhere - see the comment above */
+    }
+
+    /* Pass 2: round-robin among READY tasks that share that top priority. */
     for (uint32_t i = 1; i <= num_tasks; i++) {
         uint32_t idx = (current_index + i) % num_tasks;
-        if (task_list[idx]->state == TASK_READY) {
+        if (task_list[idx]->state == TASK_READY && (int32_t)task_list[idx]->priority == highest) {
             return (int32_t)idx;
         }
     }
-    return -1;   /* nothing runnable anywhere - see the comment above */
+    return -1;   /* unreachable: pass 1 guarantees at least one match exists */
 }
 
 void scheduler_yield(void)
